@@ -20,7 +20,9 @@
 
 using Duplicati.Library.Common.IO;
 using Duplicati.Library.Interface;
+using Duplicati.Library.Utility;
 using FluentFTP;
+using FluentFTP.Client.BaseClient;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -61,9 +63,7 @@ namespace Duplicati.Library.Backend.AlternativeFTP
 
         private readonly string _url;
         private readonly bool _listVerify = true;
-        private readonly FtpEncryptionMode _encryptionMode;
-        private readonly FtpDataConnectionType _dataConnectionType;
-        private readonly SslProtocols _sslProtocols;
+        private readonly FtpConfig _ftpConfig;
         private readonly TimeSpan _uploadWaitTime;
 
         private readonly byte[] _copybuffer = new byte[CoreUtility.DEFAULT_BUFFER_SIZE];
@@ -87,6 +87,9 @@ namespace Duplicati.Library.Backend.AlternativeFTP
         }
 
         private FtpClient Client
+        { get; set; }
+
+        private AsyncFtpClient AsyncClient
         { get; set; }
 
         public IList<ICommandLineArgument> SupportedCommands
@@ -162,42 +165,52 @@ namespace Duplicati.Library.Backend.AlternativeFTP
 
             // Process the aftp-data-connection-type option
             string dataConnectionTypeString;
+            FtpDataConnectionType dataConnectionType;
 
             if (!options.TryGetValue(CONFIG_KEY_AFTP_DATA_CONNECTION_TYPE, out dataConnectionTypeString) || string.IsNullOrWhiteSpace(dataConnectionTypeString))
             {
                 dataConnectionTypeString = null;
             }
 
-            if (dataConnectionTypeString == null || !Enum.TryParse(dataConnectionTypeString, true, out _dataConnectionType))
+            if (dataConnectionTypeString == null || !Enum.TryParse(dataConnectionTypeString, true, out dataConnectionType))
             {
-                _dataConnectionType = DEFAULT_DATA_CONNECTION_TYPE;
+                dataConnectionType = DEFAULT_DATA_CONNECTION_TYPE;
             }
 
             // Process the aftp-encryption-mode option
             string encryptionModeString;
+            FtpEncryptionMode encryptionMode;
 
             if (!options.TryGetValue(CONFIG_KEY_AFTP_ENCRYPTION_MODE, out encryptionModeString) || string.IsNullOrWhiteSpace(encryptionModeString))
             {
                 encryptionModeString = null;
             }
 
-            if (encryptionModeString == null || !Enum.TryParse(encryptionModeString, true, out _encryptionMode))
+            if (encryptionModeString == null || !Enum.TryParse(encryptionModeString, true, out encryptionMode))
             {
-                _encryptionMode = DEFAULT_ENCRYPTION_MODE;
+                encryptionMode = DEFAULT_ENCRYPTION_MODE;
             }
 
             // Process the aftp-ssl-protocols option
             string sslProtocolsString;
+            SslProtocols sslProtocols;
 
             if (!options.TryGetValue(CONFIG_KEY_AFTP_SSL_PROTOCOLS, out sslProtocolsString) || string.IsNullOrWhiteSpace(sslProtocolsString))
             {
                 sslProtocolsString = null;
             }
 
-            if (sslProtocolsString == null || !Enum.TryParse(sslProtocolsString, true, out _sslProtocols))
+            if (sslProtocolsString == null || !Enum.TryParse(sslProtocolsString, true, out sslProtocols))
             {
-                _sslProtocols = DEFAULT_SSL_PROTOCOLS;
+                sslProtocols = DEFAULT_SSL_PROTOCOLS;
             }
+
+            _ftpConfig = new FtpConfig
+            {
+                DataConnectionType = dataConnectionType,
+                EncryptionMode = encryptionMode,
+                SslProtocols = sslProtocols,
+            };
         }
 
         public IEnumerable<IFileEntry> List()
@@ -237,11 +250,11 @@ namespace Duplicati.Library.Backend.AlternativeFTP
                     // else: stripping the filename in this case ignoring it
                 }
 
-                foreach (FtpListItem item in ftpClient.GetListing(remotePath, FtpListOption.Modify | FtpListOption.Size | FtpListOption.DerefLinks))
+                foreach (FtpListItem item in ftpClient.GetListing(remotePath, FtpListOption.Modify | FtpListOption.Size))
                 {
                     switch (item.Type)
                     {
-                        case FtpFileSystemObjectType.Directory:
+                        case FtpObjectType.Directory:
                             {
                                 if (item.Name == "." || item.Name == "..")
                                 {
@@ -255,13 +268,13 @@ namespace Duplicati.Library.Backend.AlternativeFTP
 
                                 break;
                             }
-                        case FtpFileSystemObjectType.File:
+                        case FtpObjectType.File:
                             {
                                 list.Add(new FileEntry(item.Name, item.Size, new DateTime(), item.Modified));
 
                                 break;
                             }
-                        case FtpFileSystemObjectType.Link:
+                        case FtpObjectType.Link:
                             {
                                 if (item.Name == "." || item.Name == "..")
                                 {
@@ -272,7 +285,7 @@ namespace Duplicati.Library.Backend.AlternativeFTP
                                 {
                                     switch (item.LinkObject.Type)
                                     {
-                                        case FtpFileSystemObjectType.Directory:
+                                        case FtpObjectType.Directory:
                                             {
                                                 if (item.Name == "." || item.Name == "..")
                                                 {
@@ -286,7 +299,7 @@ namespace Duplicati.Library.Backend.AlternativeFTP
 
                                                 break;
                                             }
-                                        case FtpFileSystemObjectType.File:
+                                        case FtpObjectType.File:
                                             {
                                                 list.Add(new FileEntry(item.Name, item.Size, new DateTime(), item.Modified));
 
@@ -320,7 +333,7 @@ namespace Duplicati.Library.Backend.AlternativeFTP
 
             try
             {
-                var ftpClient = CreateClient();
+                var asyncFtpClient = CreateAsyncClient();
 
                 try
                 {
@@ -337,8 +350,8 @@ namespace Duplicati.Library.Backend.AlternativeFTP
                     remotePath += remotename;
                 }
 
-                var success = await ftpClient.UploadAsync(input, remotePath, FtpExists.Overwrite, createRemoteDir: false, token: cancelToken, progress: null).ConfigureAwait(false);
-                if (!success)
+                var status = await asyncFtpClient.UploadStream(input, remotePath, FtpRemoteExists.Overwrite, createRemoteDir: false, token: cancelToken, progress: null).ConfigureAwait(false);
+                if (status != FtpStatus.Success)
                 {
                     throw new UserInformationException(string.Format(Strings.ErrorWriteFile, remotename), "AftpPutFailure");
                 }
@@ -352,7 +365,7 @@ namespace Duplicati.Library.Backend.AlternativeFTP
                 if (_listVerify)
                 {
                     // check remote file size; matching file size indicates completion
-                    var remoteSize = await ftpClient.GetFileSizeAsync(remotePath, cancelToken);
+                    var remoteSize = await asyncFtpClient.GetFileSize(remotePath, -1, cancelToken);
                     if (streamLen != remoteSize)
                     {
                         throw new UserInformationException(Strings.ListVerifySizeFailure(remotename, remoteSize, streamLen), "AftpListVerifySizeFailure");
@@ -531,34 +544,45 @@ namespace Duplicati.Library.Backend.AlternativeFTP
 
         private FtpClient CreateClient()
         {
-            var uri = new Uri(_url);
-
             if (this.Client == null) // Create connection if it doesn't exist yet
             {
-                var ftpClient = new FtpClient
-                {
-                    Host = uri.Host,
-                    Port = uri.Port == -1 ? 21 : uri.Port,
-                    Credentials = _userInfo,
-                    EncryptionMode = _encryptionMode,
-                    DataConnectionType = _dataConnectionType,
-                    SslProtocols = _sslProtocols,
-
-                    // We do not support parallel uploads, and the feature is buggy
-                    EnableThreadSafeDataConnections = false,
-                };
-
-                ftpClient.ValidateCertificate += HandleValidateCertificate;
-
-                this.Client = ftpClient;
+                this.Client = new FtpClient();
+                this.ConfigureClient(this.Client);
             } // else reuse existing connection
 
             // Change working directory to the remote path
             // Do this every time to prevent issues when FtpClient silently reconnects after failure.
-            var remotePath = this.GetUnescapedAbsolutePath(uri);
+            var remotePath = this.GetUnescapedAbsolutePath(new Uri(_url));
             this.Client.SetWorkingDirectory(remotePath);
 
             return this.Client;
+        }
+
+        private AsyncFtpClient CreateAsyncClient()
+        {
+            if (this.AsyncClient == null) // Create connection if it doesn't exist yet
+            {
+                this.AsyncClient = new AsyncFtpClient();
+                this.ConfigureClient(this.AsyncClient);
+            } // else reuse existing connection
+
+            // Change working directory to the remote path
+            // Do this every time to prevent issues when FtpClient silently reconnects after failure.
+            var remotePath = this.GetUnescapedAbsolutePath(new Uri(_url));
+            this.AsyncClient.SetWorkingDirectory(remotePath).Wait();
+
+            return this.AsyncClient;
+        }
+
+        private void ConfigureClient(BaseFtpClient client)
+        {
+            var uri = new Uri(_url);
+
+            client.Host = uri.Host;
+            client.Port = uri.Port == -1 ? 21 : uri.Port;
+            client.Credentials = _userInfo;
+            client.Config = _ftpConfig;
+            client.ValidateCertificate += HandleValidateCertificate;
         }
 
         private string GetUnescapedAbsolutePath(Uri uri)
@@ -567,7 +591,7 @@ namespace Duplicati.Library.Backend.AlternativeFTP
             return absolutePath.EndsWith("/", StringComparison.Ordinal) ? absolutePath.Substring(0, absolutePath.Length - 1) : absolutePath;
         }
 
-        private void HandleValidateCertificate(FtpClient control, FtpSslValidationEventArgs e)
+        private void HandleValidateCertificate(FluentFTP.Client.BaseClient.BaseFtpClient control, FtpSslValidationEventArgs e)
         {
             if (e.PolicyErrors == SslPolicyErrors.None || _accepAllCertificates)
             {
